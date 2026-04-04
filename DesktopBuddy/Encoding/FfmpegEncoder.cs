@@ -58,11 +58,17 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private volatile bool _disposed;
     private int _disposeGuard; // Interlocked guard for idempotent Dispose
     private readonly AutoResetEvent _frameSignal = new(false);
-    private volatile IntPtr _pendingTexture; // Set by WGC callback, consumed by encode thread
+    private volatile IntPtr _pendingTexture; // Set by WGC callback, consumed by encode thread (NVENC)
     private volatile uint _pendingWidth, _pendingHeight;
+    private volatile byte[] _pendingCpuFrame; // Set by WGC readback, consumed by encode thread (AMF)
     private IntPtr _deviceContext; // FFmpeg's D3D11 device context for encode thread
     private object _d3dContextLock; // Shared lock with WgcCapture to serialize D3D11 immediate context access
-    private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode
+    private bool _needsColorConvert; // AMF: BGRA source needs conversion to NV12
+    private IntPtr _stagingTex;      // Staging texture for CPU readback (AMF path)
+    private SwsContext* _swsColorCtx; // BGRA→NV12 converter (AMF path)
+    private AVFrame* _cpuFrame;       // CPU-side NV12 frame for upload (AMF path)
+    private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode (NVENC)
+    private byte[] _lastCpuFrame; // Last CPU frame for keepalive re-encode (AMF)
     private uint _lastWidth, _lastHeight;
     private long _startTicks;
     private long _lastVideoPts = -1; // Ensure monotonic pts
@@ -241,10 +247,13 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                 _codecCtx->rc_max_rate = 12_000_000;
                 _codecCtx->rc_buffer_size = 8_000_000;
 
-                // Use BGRA sw_format for all encoders — matches WGC capture's BGRA textures.
-                // CopySubresourceRegion does a raw bit copy, so formats must match.
-                // NVENC natively accepts BGRA. AMF converts BGRA→NV12 internally.
-                var swFormat = AVPixelFormat.AV_PIX_FMT_BGRA;
+                // NVENC accepts BGRA as sw_format directly. AMF needs NV12 (BGRA not in AMF format_map,
+                // BGR0 not in D3D11VA hwcontext). For AMF, we create NV12 hw frames and use D3D11
+                // Video Processor to convert BGRA→NV12 before encoding.
+                var swFormat = name.Contains("amf")
+                    ? AVPixelFormat.AV_PIX_FMT_NV12
+                    : AVPixelFormat.AV_PIX_FMT_BGRA;
+                _needsColorConvert = name.Contains("amf");
                 SetupHardwareContext(d3dDevice, swFormat);
 
                 AVDictionary* opts = null;
@@ -277,10 +286,36 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             if (ret < 0 || codecName == null)
             {
                 ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] No GPU encoder available (need NVIDIA, AMD, or Intel GPU)");
+                // Clean up partially-allocated contexts from the last failed encoder attempt.
+                // If left dangling, Dispose() may crash freeing a codec context left in a bad
+                // state (e.g. AMF AVERROR_BUG leaves corrupt internal pointers).
+                if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
+                if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
+                if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
                 _initFailed = true; return false;
             }
 
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Codec opened: {codecName}");
+
+            // AMF needs BGRA→NV12 conversion: create staging texture, sws converter, and CPU frame
+            if (_needsColorConvert)
+            {
+                // Create staging texture for CPU readback of the BGRA source
+                _stagingTex = CreateStagingTexture(d3dDevice, _width, _height);
+                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Created staging texture {_width}x{_height} BGRA for AMF color conversion (raw input will be {width}x{height})");
+
+                // WgcCapture's compute shader converts BGRA→RGBA, so input is RGBA
+                _swsColorCtx = ffmpeg.sws_getContext(
+                    (int)_width, (int)_height, AVPixelFormat.AV_PIX_FMT_RGBA,
+                    (int)_width, (int)_height, AVPixelFormat.AV_PIX_FMT_NV12,
+                    ffmpeg.SWS_FAST_BILINEAR, null, null, null);
+
+                _cpuFrame = ffmpeg.av_frame_alloc();
+                _cpuFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
+                _cpuFrame->width = (int)_width;
+                _cpuFrame->height = (int)_height;
+                ffmpeg.av_frame_get_buffer(_cpuFrame, 0);
+            }
 
             // Allocate frame and packet
             _hwFrame = ffmpeg.av_frame_alloc();
@@ -477,9 +512,25 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         return buf_size;
     }
 
+    /// <summary>Whether this encoder needs CPU pixel data instead of GPU textures (AMF path).</summary>
+    public bool NeedsCpuFrames => _needsColorConvert;
+
+    /// <summary>
+    /// Queue CPU pixel data (RGBA, row-major, no padding) for encoding. AMF path only.
+    /// </summary>
+    public void EncodeCpuFrame(byte[] rgbaData, uint width, uint height)
+    {
+        if (_disposed || _initFailed || !_initialized) return;
+        if ((width & ~1u) != _width || (height & ~1u) != _height) return;
+        _pendingCpuFrame = rgbaData;
+        _pendingWidth = width;
+        _pendingHeight = height;
+        _frameSignal.Set();
+    }
+
     /// <summary>
     /// Queue a D3D11 texture for encoding. Returns immediately — encoding happens on background thread.
-    /// The texture must be persistent (not released after this call).
+    /// The texture must be persistent (not released after this call). NVENC path.
     /// </summary>
     public void EncodeFrame(IntPtr srcTexture, uint width, uint height)
     {
@@ -515,18 +566,30 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             if ((now - lastEncodeTicks) < frameInterval)
                 continue;
 
+            // AMF path: CPU frames; NVENC path: GPU textures
+            byte[] cpuFrame = _pendingCpuFrame;
             IntPtr texture = _pendingTexture;
-            if (texture != IntPtr.Zero)
+
+            if (cpuFrame != null)
             {
-                // New frame from WGC
+                _pendingCpuFrame = null;
+                _lastCpuFrame = cpuFrame;
+                _lastWidth = _pendingWidth;
+                _lastHeight = _pendingHeight;
+            }
+            else if (texture != IntPtr.Zero)
+            {
                 _pendingTexture = IntPtr.Zero;
                 _lastTexture = texture;
                 _lastWidth = _pendingWidth;
                 _lastHeight = _pendingHeight;
             }
+            else if (_lastCpuFrame != null)
+            {
+                cpuFrame = _lastCpuFrame;
+            }
             else if (_lastTexture != IntPtr.Zero)
             {
-                // Keepalive: re-encode last texture
                 texture = _lastTexture;
             }
             else
@@ -538,7 +601,10 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             if (_disposed) break; // re-check before expensive FFmpeg call
             try
             {
-                EncodeFrameInternal(texture, _lastWidth, _lastHeight);
+                if (cpuFrame != null)
+                    EncodeCpuFrameInternal(cpuFrame, _lastWidth, _lastHeight);
+                else
+                    EncodeFrameInternal(texture, _lastWidth, _lastHeight);
             }
             catch (Exception ex)
             {
@@ -548,27 +614,100 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Encode thread ended");
     }
 
+    /// <summary>AMF path: RGBA CPU data → sws RGBA→NV12 → upload to NV12 hw frame → encode.</summary>
+    private void EncodeCpuFrameInternal(byte[] rgbaData, uint width, uint height)
+    {
+        int ret;
+
+        // Convert RGBA → NV12
+        ffmpeg.av_frame_make_writable(_cpuFrame);
+        fixed (byte* src = rgbaData)
+        {
+            var srcData = new byte_ptrArray8();
+            var srcLinesize = new int_array8();
+            srcData[0] = src;
+            srcLinesize[0] = (int)_width * 4; // RGBA stride, no padding (WgcCapture memcpy'd without pitch)
+            ffmpeg.sws_scale(_swsColorCtx, srcData, srcLinesize, 0, (int)_height, _cpuFrame->data, _cpuFrame->linesize);
+        }
+
+        // Upload NV12 CPU frame to GPU hw frame
+        lock (_d3dContextLock)
+        {
+            ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
+            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
+
+            ret = ffmpeg.av_hwframe_transfer_data(_hwFrame, _cpuFrame, 0);
+            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_transfer_data failed: {FfmpegError(ret)}"); return; }
+        }
+
+        // PTS + encode + mux (same as GPU path)
+        double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
+        long videoPts = (long)(elapsedSec * _fps);
+        if (videoPts <= _lastVideoPts) videoPts = _lastVideoPts + 1;
+        _lastVideoPts = videoPts;
+        _hwFrame->pts = videoPts;
+        _hwFrame->width = (int)_width;
+        _hwFrame->height = (int)_height;
+
+        using (DesktopBuddyMod.Perf.Time("ffmpeg_encode"))
+        {
+            ret = ffmpeg.avcodec_send_frame(_codecCtx, _hwFrame);
+            ffmpeg.av_frame_unref(_hwFrame);
+            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_send_frame failed: {FfmpegError(ret)}"); return; }
+        }
+
+        using (DesktopBuddyMod.Perf.Time("ffmpeg_mux"))
+        {
+            while (true)
+            {
+                ret = ffmpeg.avcodec_receive_packet(_codecCtx, _pkt);
+                if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF) break;
+                if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_receive_packet failed: {FfmpegError(ret)}"); break; }
+                _pkt->stream_index = _stream->index;
+                ffmpeg.av_packet_rescale_ts(_pkt, _codecCtx->time_base, _stream->time_base);
+                ret = ffmpeg.av_write_frame(_fmtCtx, _pkt);
+                if (ret < 0) ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_write_frame failed: {FfmpegError(ret)}");
+                ffmpeg.av_packet_unref(_pkt);
+            }
+        }
+
+        if (_audioCodecCtx != null && _audioCapture != null)
+        {
+            using (DesktopBuddyMod.Perf.Time("ffmpeg_audio"))
+                EncodeAudio();
+        }
+
+        ffmpeg.avio_flush(_fmtCtx->pb);
+        _totalFrames++;
+        if (_totalFrames <= 5 || _totalFrames % 300 == 0)
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Frame #{_totalFrames} ({width}x{height}), ringPos={_ringWritePos}");
+    }
+
+    /// <summary>NVENC path: D3D11 texture → direct copy to hw frame → encode.</summary>
     private void EncodeFrameInternal(IntPtr srcTexture, uint width, uint height)
     {
         int ret;
         AVFrame* frameToEncode;
 
-        lock (_d3dContextLock)
         {
-            using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
+            // NVENC path: direct BGRA texture copy (same format, no conversion needed)
+            lock (_d3dContextLock)
             {
-                ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
-                if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
-            }
+                using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
+                {
+                    ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
+                    if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
+                }
 
-            using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
-            {
-                IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
-                int dstIndex = (int)_hwFrame->data[1];
-                CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
+                using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
+                {
+                    IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
+                    int dstIndex = (int)_hwFrame->data[1];
+                    CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
+                }
             }
+            frameToEncode = _hwFrame;
         }
-        frameToEncode = _hwFrame;
 
         // Wall clock pts — monotonically increasing, never duplicate
         double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
@@ -699,6 +838,47 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         fn(deviceContext, dstTexture, (uint)dstArrayIndex, 0, 0, 0, srcTexture, 0, box);
     }
 
+    // D3D11 helpers for AMF color conversion path
+    private const int ID3D11Device_CreateTexture2D = 5;
+    private const int ID3D11DeviceContext_Map = 14;
+    private const int ID3D11DeviceContext_Unmap = 15;
+    private const int ID3D11DeviceContext_CopyResource = 47;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct D3D11_TEX2D_DESC
+    {
+        public uint Width, Height, MipLevels, ArraySize;
+        public int Format;
+        public uint SampleCount, SampleQuality;
+        public int Usage;
+        public uint BindFlags, CPUAccessFlags, MiscFlags;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct D3D11_MAPPED
+    {
+        public IntPtr pData;
+        public uint RowPitch, DepthPitch;
+    }
+
+    private static IntPtr CreateStagingTexture(IntPtr device, uint w, uint h)
+    {
+        var desc = new D3D11_TEX2D_DESC
+        {
+            Width = w, Height = h, MipLevels = 1, ArraySize = 1,
+            Format = 87, // DXGI_FORMAT_B8G8R8A8_UNORM
+            SampleCount = 1, SampleQuality = 0,
+            Usage = 3, // D3D11_USAGE_STAGING
+            BindFlags = 0, CPUAccessFlags = 0x20000, // D3D11_CPU_ACCESS_READ
+            MiscFlags = 0
+        };
+        var vtable = *(IntPtr**)device;
+        var fn = (delegate* unmanaged[Stdcall]<IntPtr, D3D11_TEX2D_DESC*, IntPtr, out IntPtr, int>)vtable[ID3D11Device_CreateTexture2D];
+        int hr = fn(device, &desc, IntPtr.Zero, out IntPtr tex);
+        if (hr < 0) throw new System.Exception($"CreateStagingTexture failed hr=0x{hr:X8}");
+        return tex;
+    }
+
     private static string FfmpegError(int error)
     {
         var buf = stackalloc byte[256];
@@ -738,32 +918,39 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             }
 
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing packets/frames");
-            if (_pkt != null) { var p = _pkt; ffmpeg.av_packet_free(&p); _pkt = null; }
-            if (_hwFrame != null) { var f = _hwFrame; ffmpeg.av_frame_free(&f); _hwFrame = null; }
-            if (_audioFrame != null) { var f = _audioFrame; ffmpeg.av_frame_free(&f); _audioFrame = null; }
+            try { if (_pkt != null) { var p = _pkt; ffmpeg.av_packet_free(&p); _pkt = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: pkt free error: {ex.Message}"); _pkt = null; }
+            try { if (_hwFrame != null) { var f = _hwFrame; ffmpeg.av_frame_free(&f); _hwFrame = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: hwFrame free error: {ex.Message}"); _hwFrame = null; }
+            try { if (_audioFrame != null) { var f = _audioFrame; ffmpeg.av_frame_free(&f); _audioFrame = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: audioFrame free error: {ex.Message}"); _audioFrame = null; }
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing codec contexts");
-            if (_audioCodecCtx != null) { var c = _audioCodecCtx; ffmpeg.avcodec_free_context(&c); _audioCodecCtx = null; }
-            if (_swrCtx != null) { var s = _swrCtx; ffmpeg.swr_free(&s); _swrCtx = null; }
-            if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
+            try { if (_audioCodecCtx != null) { var c = _audioCodecCtx; ffmpeg.avcodec_free_context(&c); _audioCodecCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: audioCodec free error: {ex.Message}"); _audioCodecCtx = null; }
+            try { if (_swrCtx != null) { var s = _swrCtx; ffmpeg.swr_free(&s); _swrCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: swr free error: {ex.Message}"); _swrCtx = null; }
+            try { if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: codec free error: {ex.Message}"); _codecCtx = null; }
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing hw contexts");
-            if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
-            if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
+            try { if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: hwFrames free error: {ex.Message}"); _hwFramesCtx = null; }
+            try { if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: hwDevice free error: {ex.Message}"); _hwDeviceCtx = null; }
+            try { if (_cpuFrame != null) { var f = _cpuFrame; ffmpeg.av_frame_free(&f); _cpuFrame = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: cpuFrame free error: {ex.Message}"); _cpuFrame = null; }
+            try { if (_swsColorCtx != null) { ffmpeg.sws_freeContext(_swsColorCtx); _swsColorCtx = null; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: sws free error: {ex.Message}"); _swsColorCtx = null; }
+            try { if (_stagingTex != IntPtr.Zero) { Marshal.Release(_stagingTex); _stagingTex = IntPtr.Zero; } } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: staging free error: {ex.Message}"); _stagingTex = IntPtr.Zero; }
         }
         finally { if (ctxLock != null) Monitor.Exit(ctxLock); }
         _audioCapture = null;
 
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing format context");
-        if (_fmtCtx != null)
+        try
         {
-            if (_fmtCtx->pb != null)
+            if (_fmtCtx != null)
             {
-                var pb = _fmtCtx->pb;
-                ffmpeg.avio_context_free(&pb);
-                _fmtCtx->pb = null;
+                if (_fmtCtx->pb != null)
+                {
+                    var pb = _fmtCtx->pb;
+                    ffmpeg.avio_context_free(&pb);
+                    _fmtCtx->pb = null;
+                }
+                ffmpeg.avformat_free_context(_fmtCtx);
+                _fmtCtx = null;
             }
-            ffmpeg.avformat_free_context(_fmtCtx);
-            _fmtCtx = null;
         }
+        catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: fmtCtx free error: {ex.Message}"); _fmtCtx = null; }
 
         if (_selfHandle.IsAllocated) _selfHandle.Free();
 
