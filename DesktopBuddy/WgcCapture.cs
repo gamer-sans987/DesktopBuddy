@@ -201,7 +201,7 @@ public sealed class WgcCapture : IDisposable
     private volatile bool _closed;
     private int _lastWidth, _lastHeight;
     private int _framesCaptured;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     // GPU compute shader pipeline for BGRA→RGBA + Y-flip
     private IntPtr _computeShader;
@@ -227,21 +227,14 @@ public sealed class WgcCapture : IDisposable
         _isDesktop = hwnd == IntPtr.Zero;
         try
         {
-            // Try with debug layer first for better error diagnostics, fall back to no debug
-            uint deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | 0x2; // 0x2 = D3D11_CREATE_DEVICE_DEBUG
+            // BGRA support required for WGC frame surfaces. Debug layer disabled — it causes
+            // assertion crashes when D3D context is used from multiple threads during disposal.
+            uint deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
             int hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
                 deviceFlags, IntPtr.Zero, 0, 7,
                 out _d3dDevice, out _, out _d3dContext);
-            if (hr < 0)
-            {
-                ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] Debug device failed (hr=0x{hr:X8}), trying without debug");
-                deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-                hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
-                    deviceFlags, IntPtr.Zero, 0, 7,
-                    out _d3dDevice, out _, out _d3dContext);
-            }
             if (hr < 0) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] D3D11CreateDevice failed hr=0x{hr:X8}"); return false; }
-            ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] D3D11 device created (debug={(deviceFlags & 0x2) != 0})");
+            ResoniteModLoader.ResoniteMod.Msg("[WgcCapture] D3D11 device created");
 
             var dxgiGuid = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
             Marshal.QueryInterface(_d3dDevice, ref dxgiGuid, out IntPtr dxgiDevice);
@@ -405,7 +398,8 @@ public sealed class WgcCapture : IDisposable
             // GPU encode callback — NVENC encodes from the persistent copy
             using (DesktopBuddyMod.Perf.Time("nvenc_encode"))
             {
-                try { OnGpuFrame?.Invoke(_d3dDevice, _encodeTexture, w, h); }
+                var gpuCb = OnGpuFrame;
+                try { gpuCb?.Invoke(_d3dDevice, _encodeTexture, w, h); }
                 catch (Exception gpuEx) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture] OnGpuFrame error: {gpuEx}"); }
             }
 
@@ -812,31 +806,55 @@ public sealed class WgcCapture : IDisposable
         return buffer;
     }
 
+    // Serializes access to the D3D11 immediate context. Used by OnFrameArrived (WGC thread)
+    // and shared with FfmpegEncoder's encode thread. D3D11 contexts are NOT thread-safe.
     private readonly object _disposeLock = new();
+
+    /// <summary>
+    /// Lock object that serializes D3D11 immediate context access.
+    /// Pass this to FfmpegEncoder.Initialize so the encode thread doesn't race with OnFrameArrived.
+    /// </summary>
+    public object D3dContextLock => _disposeLock;
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-
-        // Stop WGC from delivering new frames
-        try { _session?.Dispose(); } catch { }
-        try { _framePool?.Dispose(); } catch { }
-        _item = null;
-
-        // Wait for any in-flight OnFrameArrived callback to finish
+        // Acquire _disposeLock to: (1) atomically check+set _disposed, and
+        // (2) wait for any in-flight OnFrameArrived to finish before we touch anything.
+        // After this lock releases, _disposed is volatile-true so new callbacks bail immediately.
         lock (_disposeLock)
         {
-            ReleaseGpuConvertResources();
-            if (_computeShader != IntPtr.Zero) { Marshal.Release(_computeShader); _computeShader = IntPtr.Zero; }
-            if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
-            if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
-            if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
-            if (_d3dDevice != IntPtr.Zero) { Marshal.Release(_d3dDevice); _d3dDevice = IntPtr.Zero; }
+            if (_disposed) return;
+            _disposed = true;
         }
-        try { _winrtDevice?.Dispose(); } catch { }
+        ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture:Dispose] === START === hwnd={_hwnd}");
+
+        // NOW safe to dispose WGC session and frame pool — no callback is using them
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Disposing WGC session");
+        try { _session?.Dispose(); } catch (Exception ex) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture:Dispose] session dispose error: {ex.Message}"); }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Disposing frame pool");
+        try { _framePool?.Dispose(); } catch (Exception ex) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture:Dispose] framePool dispose error: {ex.Message}"); }
+        _item = null;
+
+        // Release GPU resources — no lock needed, all callbacks are stopped
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Releasing GPU resources");
+        ReleaseGpuConvertResources();
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] GPU convert resources released");
+        if (_computeShader != IntPtr.Zero) { Marshal.Release(_computeShader); _computeShader = IntPtr.Zero; }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Compute shader released");
+        if (_encodeTexture != IntPtr.Zero) { Marshal.Release(_encodeTexture); _encodeTexture = IntPtr.Zero; }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Encode texture released");
+        if (_stagingTexture != IntPtr.Zero) { Marshal.Release(_stagingTexture); _stagingTexture = IntPtr.Zero; }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Staging texture released");
+        if (_d3dContext != IntPtr.Zero) { Marshal.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] D3D context released");
+        if (_d3dDevice != IntPtr.Zero) { Marshal.Release(_d3dDevice); _d3dDevice = IntPtr.Zero; }
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] D3D device released");
+
+        ResoniteModLoader.ResoniteMod.Msg("[WgcCapture:Dispose] Disposing WinRT device");
+        try { _winrtDevice?.Dispose(); } catch (Exception ex) { ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture:Dispose] winrtDevice dispose error: {ex.Message}"); }
 
         if (_pinnedBuffer.IsAllocated) _pinnedBuffer.Free();
         _buffer = null;
+        ResoniteModLoader.ResoniteMod.Msg($"[WgcCapture:Dispose] === DONE === hwnd={_hwnd}");
     }
 }

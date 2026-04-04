@@ -418,6 +418,26 @@ public static class WindowInput
     }
 
     /// <summary>
+    /// Send Ctrl+V (paste) via SendInput.
+    /// </summary>
+    public static void SendPaste()
+    {
+        ResoniteMod.Msg("[Keyboard] Sending Ctrl+V (paste)");
+        const ushort VK_CONTROL = 0xA2; // Left Ctrl
+        const ushort VK_V = 0x56;
+        var inputs = new INPUT[]
+        {
+            new INPUT { type = INPUT_KEYBOARD, u = new INPUTUNION { ki = new KEYBDINPUT { wVk = VK_CONTROL } } },
+            new INPUT { type = INPUT_KEYBOARD, u = new INPUTUNION { ki = new KEYBDINPUT { wVk = VK_V } } },
+            new INPUT { type = INPUT_KEYBOARD, u = new INPUTUNION { ki = new KEYBDINPUT { wVk = VK_V, dwFlags = KEYEVENTF_KEYUP } } },
+            new INPUT { type = INPUT_KEYBOARD, u = new INPUTUNION { ki = new KEYBDINPUT { wVk = VK_CONTROL, dwFlags = KEYEVENTF_KEYUP } } },
+        };
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        if (sent != inputs.Length)
+            ResoniteMod.Msg($"[Keyboard] SendPaste FAILED sent={sent}/{inputs.Length} err={Marshal.GetLastWin32Error()}");
+    }
+
+    /// <summary>
     /// Release all held modifier keys.
     /// </summary>
     public static void ReleaseAllModifiers()

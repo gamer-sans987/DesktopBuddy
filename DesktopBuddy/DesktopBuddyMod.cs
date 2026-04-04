@@ -100,7 +100,7 @@ public class DesktopBuddyMod : ResoniteMod
             var userRoot = localUser.Root;
             if (userRoot == null) { Msg("[SpawnStreaming] UserRoot is null, aborting"); return; }
 
-            var root = world.RootSlot.AddSlot("Desktop Buddy");
+            var root = (localUser.Root.Slot.Parent ?? world.RootSlot).AddSlot("Desktop Buddy");
 
             var headPos = userRoot.HeadPosition;
             var headRot = userRoot.HeadRotation;
@@ -162,6 +162,10 @@ public class DesktopBuddyMod : ResoniteMod
         // Canvas with RawImage pointing at the texture — on displaySlot, NOT root
         float canvasScale = 0.001f;
         var ui = new UIBuilder(displaySlot, w, h, canvasScale);
+
+        var displayBg = ui.Image(new colorX(0f, 0f, 0f, 1f));
+        ui.NestInto(displayBg.RectTransform);
+
         var rawImage = ui.RawImage(procTex);
         Msg("[StartStreaming] Canvas + RawImage created");
 
@@ -176,6 +180,10 @@ public class DesktopBuddyMod : ResoniteMod
         btn.PassThroughVerticalMovement.Value = false;
         Msg("[StartStreaming] Button attached");
 
+        // Get process ID for child window tracking
+        WindowEnumerator.GetWindowThreadProcessId(hwnd, out uint processId);
+        Msg($"[StartStreaming] Process ID: {processId}");
+
         // Create session early so event handlers can reference it
         var session = new DesktopSession
         {
@@ -185,6 +193,7 @@ public class DesktopBuddyMod : ResoniteMod
             Root = root,
             TargetInterval = 1.0 / fps,
             Hwnd = hwnd,
+            ProcessId = processId,
         };
         ActiveSessions.Add(session);
         DesktopCanvasIds.Add(ui.Canvas.ReferenceID);
@@ -360,22 +369,88 @@ public class DesktopBuddyMod : ResoniteMod
             }
         };
 
-        // Button bar below the canvas
+        // Button bar below the canvas — dark themed toolbar
         float worldHalfH = (h / 2f) * canvasScale;
         var btnBarSlot = root.AddSlot("ButtonBar");
-        btnBarSlot.LocalPosition = new float3(0f, -worldHalfH - 0.03f, 0f);
+        float btnBarHeight = 80f * canvasScale; // 0.08f
+        btnBarSlot.LocalPosition = new float3(0f, -worldHalfH - btnBarHeight / 2f - 0.005f, 0f);
         btnBarSlot.LocalScale = float3.One * canvasScale;
         var btnBarCanvas = btnBarSlot.AttachComponent<Canvas>();
-        btnBarCanvas.Size.Value = new float2(600, 40);
+        btnBarCanvas.Size.Value = new float2(w, 80);
         var btnBarUi = new UIBuilder(btnBarCanvas);
-        btnBarUi.HorizontalLayout(4f);
+
+        // Black canvas background — everything nests inside this
+        var barBg = btnBarUi.Image(new colorX(0.1f, 0.1f, 0.12f, 1f));
+        btnBarUi.NestInto(barBg.RectTransform);
+
+        btnBarUi.VerticalLayout(0f);
         btnBarUi.Style.FlexibleWidth = 1f;
-        btnBarUi.Style.MinHeight = 40f;
+        btnBarUi.Style.FlexibleHeight = 1f;
+
+        // Top row: buttons
+        btnBarUi.Style.MinHeight = 36f;
+        btnBarUi.Style.PreferredHeight = 36f;
+        btnBarUi.Style.FlexibleHeight = -1f;
+        btnBarUi.HorizontalLayout(6f, childAlignment: Alignment.MiddleCenter);
+        btnBarUi.Style.FlexibleWidth = 1f;
+        btnBarUi.Style.MinHeight = 32f;
+
+        // Helper: style a button with dark theme
+        void StyleButton(Button btn, colorX bgColor)
+        {
+            var txt = btn.Slot.GetComponentInChildren<TextRenderer>();
+            if (txt != null)
+            {
+                txt.Color.Value = new colorX(0.9f, 0.9f, 0.9f, 1f);
+                txt.Size.Value = 16f;
+            }
+            // Restyle the existing color driver from UIBuilder
+            if (btn.ColorDrivers.Count > 0)
+            {
+                var cd = btn.ColorDrivers[0];
+                cd.NormalColor.Value = bgColor;
+                cd.HighlightColor.Value = bgColor * 1.3f;
+                cd.PressColor.Value = bgColor * 0.7f;
+            }
+        }
+
+        var darkBtn = new colorX(0.2f, 0.2f, 0.25f, 1f);
+        var accentBtn = new colorX(0.25f, 0.35f, 0.55f, 1f);
 
         var kbBtn = btnBarUi.Button("Keyboard");
-        var testStreamBtn = btnBarUi.Button("Test Stream");
+        StyleButton(kbBtn, darkBtn);
+        var pasteBtn = btnBarUi.Button("Paste");
+        StyleButton(pasteBtn, darkBtn);
+        var testStreamBtn = btnBarUi.Button("Preview");
+        StyleButton(testStreamBtn, accentBtn);
         var resyncBtn = btnBarUi.Button("Resync");
+        StyleButton(resyncBtn, darkBtn);
         var anchorBtn = btnBarUi.Button("Anchor");
+        StyleButton(anchorBtn, darkBtn);
+        var privateBtn = btnBarUi.Button("Private");
+        StyleButton(privateBtn, darkBtn);
+
+        btnBarUi.NestOut(); // exit horizontal layout
+
+        // Bottom row: volume slider
+        btnBarUi.Style.MinHeight = 32f;
+        btnBarUi.Style.PreferredHeight = 32f;
+        btnBarUi.Style.FlexibleHeight = -1f;
+        btnBarUi.HorizontalLayout(6f, childAlignment: Alignment.MiddleCenter);
+        btnBarUi.Style.FlexibleWidth = 1f;
+
+        btnBarUi.Style.FlexibleWidth = -1f;
+        btnBarUi.Style.MinWidth = 60f;
+        var volLabel = btnBarUi.Text("Vol", bestFit: false, alignment: Alignment.MiddleLeft);
+        volLabel.Size.Value = 18f;
+        volLabel.Color.Value = new colorX(0.7f, 0.7f, 0.7f, 1f);
+
+        btnBarUi.Style.FlexibleWidth = 1f;
+        btnBarUi.Style.MinWidth = -1f;
+        var volSlider = btnBarUi.Slider<float>(28f, 1f, 0f, 1f, false);
+
+        btnBarUi.NestOut(); // exit horizontal layout
+
         Msg($"[StartStreaming] Button bar created at y={btnBarSlot.LocalPosition.y:F4}");
 
         Slot keyboardSlot = null;
@@ -390,7 +465,7 @@ public class DesktopBuddyMod : ResoniteMod
                 if (show)
                 {
                     // Reset to default position/rotation in case user dragged it
-                    keyboardSlot.LocalPosition = new float3(0f, -worldHalfH - 0.09f, -0.08f);
+                    keyboardSlot.LocalPosition = new float3(0f, -worldHalfH - btnBarHeight - 0.05f, -0.08f);
                     keyboardSlot.LocalRotation = floatQ.Euler(30f, 0f, 0f);
                     keyboardSlot.LocalScale = float3.One;
                 }
@@ -399,7 +474,7 @@ public class DesktopBuddyMod : ResoniteMod
             Msg("[Keyboard] Spawning virtual keyboard (favorite or fallback)");
             keyboardSlot = root.AddSlot("Virtual Keyboard");
             // Position just below the keyboard button, angled up toward user
-            keyboardSlot.LocalPosition = new float3(0f, -worldHalfH - 0.09f, -0.08f);
+            keyboardSlot.LocalPosition = new float3(0f, -worldHalfH - btnBarHeight - 0.05f, -0.08f);
             keyboardSlot.LocalRotation = floatQ.Euler(30f, 0f, 0f);
             // Do NOT set LocalScale — the cloud keyboard has its own natural size
             // SpawnEntity loads the user's favorited keyboard from cloud, falls back to SimpleVirtualKeyboard
@@ -442,8 +517,11 @@ public class DesktopBuddyMod : ResoniteMod
                 if (displayVisComp != null)
                     displayVisComp.SetOverride(root.World.LocalUser, !streamTestMode);
                 if (volOverrideRef != null && !volOverrideRef.IsDestroyed)
-                    volOverrideRef.SetOverride(root.World.LocalUser, streamTestMode ? 1f : 0f);
-                Msg($"[TestStream] Test mode: {streamTestMode} (stream={streamTestMode}, preview={!streamTestMode}, volume={( streamTestMode ? 1f : 0f)})");
+                {
+                    float vol = streamTestMode ? volSlider.Value.Value : 0f;
+                    volOverrideRef.SetOverride(root.World.LocalUser, vol);
+                }
+                Msg($"[TestStream] Test mode: {streamTestMode} (stream={streamTestMode}, preview={!streamTestMode})");
             }
             else
             {
@@ -500,6 +578,34 @@ public class DesktopBuddyMod : ResoniteMod
                 Msg($"[Anchor] Unanchored to world");
                 isAnchored = false;
             }
+        };
+
+        // Paste button — sends Ctrl+V to Resonite window
+        pasteBtn.LocalPressed += (IButton b, ButtonEventData d) =>
+        {
+            Msg("[Paste] Button pressed");
+            WindowInput.SendPaste();
+        };
+
+        // Private mode — hides stream visual from all other users
+        bool isPrivate = false;
+        ValueUserOverride<bool> streamVisForPrivate = null; // set when stream is created
+        privateBtn.LocalPressed += (IButton b, ButtonEventData d) =>
+        {
+            isPrivate = !isPrivate;
+            Msg($"[Private] Mode: {isPrivate}");
+            if (streamVisForPrivate != null && !streamVisForPrivate.IsDestroyed)
+                streamVisForPrivate.Default.Value = !isPrivate; // false = hidden from others
+            // Update button visual
+            var img = privateBtn.Slot.GetComponent<Image>();
+            if (img != null) img.Tint.Value = isPrivate ? new colorX(0.5f, 0.2f, 0.2f, 1f) : darkBtn;
+        };
+
+        // Volume slider — drives the per-user volume override for the local user
+        volSlider.Value.OnValueChange += (SyncField<float> field) =>
+        {
+            if (volOverrideRef != null && !volOverrideRef.IsDestroyed)
+                volOverrideRef.SetOverride(root.World.LocalUser, field.Value);
         };
 
         // --- Back panel: dark opaque background with centered icon + title ---
@@ -664,10 +770,11 @@ public class DesktopBuddyMod : ResoniteMod
                 if (isFirstForHwnd)
                 {
                     var audioForEncoder = shared.Audio;
+                    var contextLock = session.Streamer.D3dContextLock;
                     session.Streamer.OnGpuFrame = (device, texture, fw, fh) =>
                     {
                         if (!nvEncoder.IsInitialized)
-                            nvEncoder.Initialize(device, (uint)fw, (uint)fh, audioForEncoder);
+                            nvEncoder.Initialize(device, (uint)fw, (uint)fh, contextLock, audioForEncoder);
                         nvEncoder.EncodeFrame(texture, (uint)fw, (uint)fh);
                     };
                     Msg($"[RemoteStream] This panel drives the encoder for stream {shared.StreamId}");
@@ -709,11 +816,15 @@ public class DesktopBuddyMod : ResoniteMod
                 streamVis.CreateOverrideOnWrite.Value = false;
                 streamVis.SetOverride(root.World.LocalUser, false); // Spawner: hidden
                 streamVisRef = streamVis;
+                streamVisForPrivate = streamVis;
                 Msg("[RemoteStream] Per-user visibility on visual (local=false, others=true)");
 
                 var streamCanvas = streamSlot.AttachComponent<Canvas>();
                 streamCanvas.Size.Value = new float2(w, h);
                 var streamUi = new UIBuilder(streamCanvas);
+
+                var streamBg = streamUi.Image(new colorX(0f, 0f, 0f, 1f));
+                streamUi.NestInto(streamBg.RectTransform);
 
                 var streamImg = streamUi.RawImage(videoTex);
                 var streamMat = streamSlot.AttachComponent<UI_UnlitMaterial>();
@@ -774,6 +885,91 @@ public class DesktopBuddyMod : ResoniteMod
         Msg($"[StartStreaming] Window focused, streaming started for: {title}");
     }
 
+    /// <summary>
+    /// Spawn a full DesktopBuddy for a child/popup window, positioned relative to the parent.
+    /// </summary>
+    private static void SpawnChildWindow(DesktopSession parentSession, IntPtr childHwnd)
+    {
+        if (!WindowEnumerator.TryGetWindowRect(parentSession.Hwnd, out int px, out int py, out int pw, out int ph))
+        {
+            Msg($"[ChildWindow] Failed to get parent window rect");
+            return;
+        }
+        if (!WindowEnumerator.TryGetWindowRect(childHwnd, out int cx, out int cy, out int cw, out int ch))
+        {
+            Msg($"[ChildWindow] Failed to get child window rect hwnd={childHwnd}");
+            return;
+        }
+        if (cw <= 0 || ch <= 0) return;
+
+        // Get window title
+        var sb = new System.Text.StringBuilder(256);
+        GetWindowText(childHwnd, sb, sb.Capacity);
+        string title = sb.ToString();
+        if (string.IsNullOrEmpty(title)) title = $"Popup ({childHwnd})";
+
+        // Position relative to parent: map screen pixel offset to world space
+        float canvasScale = 0.001f;
+        float offsetX, offsetY;
+        float offsetZ = -0.01f; // 1cm in front of parent
+
+        // Explorer children (file dialogs, properties, etc.) go to center of parent
+        // because explorer's child windows have unpredictable screen positions
+        bool isExplorer = false;
+        try
+        {
+            var proc = System.Diagnostics.Process.GetProcessById((int)parentSession.ProcessId);
+            isExplorer = proc.ProcessName.Equals("explorer", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { }
+
+        if (isExplorer)
+        {
+            offsetX = 0f;
+            offsetY = 0f;
+            Msg($"[ChildWindow] Explorer detected — centering child on parent");
+        }
+        else
+        {
+            offsetX = ((cx - px) + cw / 2f - pw / 2f) * canvasScale;
+            offsetY = (-(cy - py) - ch / 2f + ph / 2f) * canvasScale;
+        }
+
+        var root = parentSession.Root.AddSlot($"Popup: {title}");
+        root.LocalPosition = new float3(offsetX, offsetY, offsetZ);
+        Msg($"[ChildWindow] Spawning full DesktopBuddy for hwnd={childHwnd} title='{title}' size={cw}x{ch} offset=({offsetX:F4},{offsetY:F4})");
+
+        // Track BEFORE StartStreaming so the session can be found
+        parentSession.TrackedChildHwnds.Add(childHwnd);
+
+        try
+        {
+            StartStreaming(root, childHwnd, title);
+
+            // Find the session that was just created and set up parent-child relationship
+            var childSession = ActiveSessions.Find(s => s.Hwnd == childHwnd && s.Root == root);
+            if (childSession != null)
+            {
+                childSession.ParentSession = parentSession;
+                parentSession.ChildSessions.Add(childSession);
+                Msg($"[ChildWindow] Full DesktopBuddy spawned, parent now tracking {parentSession.ChildSessions.Count} children");
+            }
+            else
+            {
+                Msg($"[ChildWindow] Warning: StartStreaming succeeded but session not found");
+            }
+        }
+        catch (Exception ex)
+        {
+            Msg($"[ChildWindow] Failed to spawn: {ex.Message}");
+            parentSession.TrackedChildHwnds.Remove(childHwnd);
+            if (!root.IsDestroyed) root.Destroy();
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+
     private static readonly HashSet<World> _scheduledWorlds = new();
 
     internal static void ScheduleUpdate(World world)
@@ -816,37 +1012,89 @@ public class DesktopBuddyMod : ResoniteMod
 
     private static void CleanupSession(DesktopSession session)
     {
+        if (session.Cleaned) { Msg($"[Cleanup] Already cleaned hwnd={session.Hwnd} streamId={session.StreamId}, skipping"); return; }
+        session.Cleaned = true;
+        Msg($"[Cleanup] === START === hwnd={session.Hwnd} streamId={session.StreamId} isChild={session.IsChildPanel} children={session.ChildSessions.Count}");
+
+        // Clean up child popup sessions first
+        if (session.ChildSessions.Count > 0)
+        {
+            Msg($"[Cleanup] Destroying {session.ChildSessions.Count} child popup panels");
+            foreach (var child in session.ChildSessions)
+            {
+                Msg($"[Cleanup] Child: nulling OnGpuFrame hwnd={child.Hwnd}");
+                if (child.Streamer != null) child.Streamer.OnGpuFrame = null;
+                child.ParentSession = null;
+                // Don't remove from ActiveSessions here — it corrupts indices if the
+                // caller is iterating ActiveSessions. The Cleaned flag ensures the main
+                // loop skips re-cleanup, and it will remove them via RemoveAt(i) safely.
+                Msg($"[Cleanup] Child: disconnecting VTP hwnd={child.Hwnd}");
+                if (child.Root != null && !child.Root.IsDestroyed)
+                {
+                    var vtp = child.Root.GetComponentInChildren<VideoTextureProvider>();
+                    if (vtp != null && !vtp.IsDestroyed) { vtp.URL.Value = null; vtp.Stop(); }
+                    var childWorld = child.Root.World;
+                    var rootToDie = child.Root;
+                    if (childWorld != null && !childWorld.IsDestroyed)
+                    {
+                        childWorld.RunInUpdates(10, () =>
+                        {
+                            Msg($"[Cleanup] Child deferred destroy executing hwnd={child.Hwnd}");
+                            if (rootToDie != null && !rootToDie.IsDestroyed) rootToDie.Destroy();
+                            Msg($"[Cleanup] Child deferred destroy complete hwnd={child.Hwnd}");
+                        });
+                    }
+                    else
+                    {
+                        Msg($"[Cleanup] Child world dead, destroying now hwnd={child.Hwnd}");
+                        rootToDie.Destroy();
+                    }
+                }
+                Msg($"[Cleanup] Child: calling CleanupSession recursively hwnd={child.Hwnd}");
+                CleanupSession(child);
+                Msg($"[Cleanup] Child: done hwnd={child.Hwnd}");
+            }
+            session.ChildSessions.Clear();
+            session.TrackedChildHwnds.Clear();
+        }
+
+        // If this is a child panel, remove from parent's tracking
+        if (session.ParentSession != null)
+        {
+            Msg($"[Cleanup] Removing from parent tracking");
+            session.ParentSession.TrackedChildHwnds.Remove(session.Hwnd);
+            session.ParentSession.ChildSessions.Remove(session);
+        }
+
+        Msg($"[Cleanup] Removing canvas ID");
         if (session.Canvas != null) DesktopCanvasIds.Remove(session.Canvas.ReferenceID);
 
-        // Heavy dispose (thread joins, FFmpeg teardown, GPU resource release) on background
-        // thread so the engine update loop isn't blocked
+        Msg($"[Cleanup] Nulling OnGpuFrame callback");
         var streamer = session.Streamer;
+        if (streamer != null) streamer.OnGpuFrame = null;
         int streamId = session.StreamId;
         IntPtr hwnd = session.Hwnd;
         session.Streamer = null;
 
+        Msg($"[Cleanup] Queuing background dispose for stream {streamId}");
         System.Threading.ThreadPool.QueueUserWorkItem(_ =>
         {
             try
             {
-                Msg($"[Cleanup] Background dispose starting for stream {streamId}");
-                streamer?.Dispose();
-                Msg($"[Cleanup] Streamer disposed for stream {streamId}");
+                Msg($"[Cleanup:BG] === START === stream {streamId}");
 
+                AudioCapture audioToDispose = null;
+                bool shouldStopEncoder = false;
                 if (streamId > 0)
                 {
-                    // Decide what to clean up under the lock, but do the heavy
-                    // Dispose/StopEncoder OUTSIDE the lock to avoid deadlocking
-                    // the engine thread if it tries to lock _sharedStreams during spawn
-                    AudioCapture audioToDispose = null;
-                    bool shouldStopEncoder = false;
-
+                    Msg($"[Cleanup:BG] Taking _sharedStreams lock");
                     lock (_sharedStreams)
                     {
+                        Msg($"[Cleanup:BG] Lock acquired");
                         if (_sharedStreams.TryGetValue(hwnd, out var shared) && shared.StreamId == streamId)
                         {
                             shared.RefCount--;
-                            Msg($"[Cleanup] Stream {shared.StreamId} refs now {shared.RefCount}");
+                            Msg($"[Cleanup:BG] Stream {shared.StreamId} refs now {shared.RefCount}");
                             if (shared.RefCount <= 0)
                             {
                                 _sharedStreams.Remove(hwnd);
@@ -857,28 +1105,38 @@ public class DesktopBuddyMod : ResoniteMod
                         else
                         {
                             shouldStopEncoder = true;
+                            Msg($"[Cleanup:BG] Orphaned stream");
                         }
                     }
+                    Msg($"[Cleanup:BG] Lock released, shouldStop={shouldStopEncoder}");
 
-                    // Heavy teardown outside the lock
-                    if (audioToDispose != null)
-                    {
-                        audioToDispose.Dispose();
-                        Msg($"[Cleanup] Audio disposed for stream {streamId}");
-                    }
                     if (shouldStopEncoder)
                     {
+                        Msg($"[Cleanup:BG] Stopping encoder {streamId}...");
                         StreamServer?.StopEncoder(streamId);
-                        Msg($"[Cleanup] Encoder {streamId} stopped");
+                        Msg($"[Cleanup:BG] Encoder {streamId} stopped");
                     }
                 }
-                Msg($"[Cleanup] Background dispose finished for stream {streamId}");
+
+                Msg($"[Cleanup:BG] Disposing streamer...");
+                streamer?.Dispose();
+                Msg($"[Cleanup:BG] Streamer disposed");
+
+                if (audioToDispose != null)
+                {
+                    Msg($"[Cleanup:BG] Disposing audio...");
+                    audioToDispose.Dispose();
+                    Msg($"[Cleanup:BG] Audio disposed");
+                }
+
+                Msg($"[Cleanup:BG] === DONE === stream {streamId}");
             }
             catch (Exception ex)
             {
-                Msg($"[Cleanup] Background dispose error: {ex}");
+                Msg($"[Cleanup:BG] ERROR: {ex}");
             }
         });
+        Msg($"[Cleanup] === END (bg queued) === stream {streamId}");
     }
 
     private static void UpdateLoop(World world)
@@ -909,28 +1167,113 @@ public class DesktopBuddyMod : ResoniteMod
             {
                 var session = ActiveSessions[i];
 
+                // Session already cleaned (e.g. child cleaned during parent cleanup) — just remove
+                if (session.Cleaned)
+                {
+                    ActiveSessions.RemoveAt(i);
+                    continue;
+                }
+
                 if (session.Root == null || session.Root.IsDestroyed ||
                     session.Texture == null || session.Texture.IsDestroyed)
                 {
-                    Msg($"[UpdateLoop] Session {i} root/texture destroyed, cleaning up");
+                    Msg($"[UpdateLoop] Session {i} root/texture destroyed, cleaning up (root={session.Root != null} rootDestroyed={session.Root?.IsDestroyed} tex={session.Texture != null} texDestroyed={session.Texture?.IsDestroyed} hwnd={session.Hwnd} streamId={session.StreamId})");
+                    Msg("[UpdateLoop] Step 1: Nulling OnGpuFrame");
+                    if (session.Streamer != null) session.Streamer.OnGpuFrame = null;
+                    Msg("[UpdateLoop] Step 2: Calling CleanupSession");
                     CleanupSession(session);
+                    Msg("[UpdateLoop] Step 3: Removing from ActiveSessions");
                     ActiveSessions.RemoveAt(i);
+                    Msg("[UpdateLoop] Step 4: Session removed, continuing");
                     continue;
                 }
 
                 if (session.Root.World != world) continue;
                 if (session.UpdateInProgress) continue;
 
-                // Window closed — destroy viewer safely by detaching children first
-                if (!session.Streamer.IsValid)
+                // Window closed — disconnect libVLC first, then destroy after a delay
+                // libVLC's stop can block the engine thread if destroyed synchronously
+                if (session.Streamer != null && !session.Streamer.IsValid)
                 {
                     Msg($"[UpdateLoop] Window closed (IsValid=false), destroying viewer");
                     CleanupSession(session);
-                    // Destroy children first to avoid cascade NullRefs in engine OnChanges
-                    session.Root.DestroyChildren();
-                    session.Root.Destroy();
                     ActiveSessions.RemoveAt(i);
+
+                    // Disconnect VideoTextureProvider before destroying so libVLC doesn't block
+                    var vtp = session.Root.GetComponentInChildren<VideoTextureProvider>();
+                    if (vtp != null && !vtp.IsDestroyed)
+                    {
+                        Msg("[UpdateLoop] Disconnecting VideoTextureProvider before destroy");
+                        vtp.URL.Value = null;
+                        vtp.Stop();
+                    }
+                    // Defer actual slot destruction to give libVLC time to release
+                    var rootToDestroy = session.Root;
+                    world.RunInUpdates(10, () =>
+                    {
+                        Msg("[UpdateLoop] Deferred destroy executing");
+                        if (rootToDestroy != null && !rootToDestroy.IsDestroyed)
+                        {
+                            rootToDestroy.DestroyChildren();
+                            rootToDestroy.Destroy();
+                        }
+                        Msg("[UpdateLoop] Deferred destroy complete");
+                    });
                     continue;
+                }
+
+                // --- Child window polling — runs every tick, independent of frame capture ---
+                if (!session.IsChildPanel && session.ProcessId != 0)
+                {
+                    session.TimeSinceChildCheck += dt;
+                    if (session.TimeSinceChildCheck >= 0.1) // 100ms poll
+                    {
+                        session.TimeSinceChildCheck = 0;
+                        try
+                        {
+                            var procWindows = WindowEnumerator.GetProcessWindows(session.ProcessId);
+                            foreach (var win in procWindows)
+                            {
+                                if (win.Handle == session.Hwnd) continue;
+                                if (session.TrackedChildHwnds.Contains(win.Handle)) continue;
+                                if (WindowEnumerator.TryGetWindowRect(win.Handle, out _, out _, out int cw2, out int ch2) && cw2 > 10 && ch2 > 10)
+                                {
+                                    Msg($"[ChildWindow] Detected new popup: hwnd={win.Handle} title='{win.Title}' size={cw2}x{ch2}");
+                                    SpawnChildWindow(session, win.Handle);
+                                }
+                            }
+
+                            var activeHwnds = new HashSet<IntPtr>(procWindows.Select(pw => pw.Handle));
+                            for (int c = session.ChildSessions.Count - 1; c >= 0; c--)
+                            {
+                                var child = session.ChildSessions[c];
+                                if (child.Streamer == null || !activeHwnds.Contains(child.Hwnd))
+                                {
+                                    Msg($"[ChildWindow] Popup closed: hwnd={child.Hwnd}");
+                                    session.TrackedChildHwnds.Remove(child.Hwnd);
+                                    if (child.Streamer != null) child.Streamer.OnGpuFrame = null;
+                                    child.ParentSession = null;
+                                    ActiveSessions.Remove(child);
+                                    session.ChildSessions.RemoveAt(c);
+                                    if (child.Root != null && !child.Root.IsDestroyed)
+                                    {
+                                        var cvtp = child.Root.GetComponentInChildren<VideoTextureProvider>();
+                                        if (cvtp != null && !cvtp.IsDestroyed) { cvtp.URL.Value = null; cvtp.Stop(); }
+                                        var cRoot = child.Root;
+                                        world.RunInUpdates(10, () =>
+                                        {
+                                            if (cRoot != null && !cRoot.IsDestroyed) cRoot.Destroy();
+                                        });
+                                    }
+                                    CleanupSession(child);
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Msg($"[ChildWindow] Polling error: {ex.Message}");
+                        }
+                    }
                 }
 
                 // Throttle to target FPS using engine time
@@ -1329,5 +1672,14 @@ public class DesktopSession
     public int StreamWidth, StreamHeight;
     public readonly object StreamLock = new();
     public volatile bool StreamFrameReady;
+
+    // Child window tracking — popups, dialogs, context menus from the same process
+    public uint ProcessId;
+    public double TimeSinceChildCheck;
+    public HashSet<IntPtr> TrackedChildHwnds = new();
+    public List<DesktopSession> ChildSessions = new();
+    public DesktopSession ParentSession; // non-null if this IS a child panel
+    public bool IsChildPanel => ParentSession != null;
+    public bool Cleaned; // Guard: CleanupSession already ran for this session
 
 }

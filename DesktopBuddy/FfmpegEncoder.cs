@@ -56,10 +56,12 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     // Async encode: WGC callback signals new frame, encode thread does the work
     private Thread _encodeThread;
     private volatile bool _disposed;
+    private int _disposeGuard; // Interlocked guard for idempotent Dispose
     private readonly AutoResetEvent _frameSignal = new(false);
     private volatile IntPtr _pendingTexture; // Set by WGC callback, consumed by encode thread
     private volatile uint _pendingWidth, _pendingHeight;
     private IntPtr _deviceContext; // FFmpeg's D3D11 device context for encode thread
+    private object _d3dContextLock; // Shared lock with WgcCapture to serialize D3D11 immediate context access
     private IntPtr _lastTexture; // Last encoded texture for keepalive re-encode
     private uint _lastWidth, _lastHeight;
     private long _startTicks;
@@ -176,12 +178,13 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     /// </summary>
     private readonly object _initLock = new();
 
-    public bool Initialize(IntPtr d3dDevice, uint width, uint height, AudioCapture audioCapture = null)
+    public bool Initialize(IntPtr d3dDevice, uint width, uint height, object d3dContextLock, AudioCapture audioCapture = null)
     {
         lock (_initLock)
         {
         if (_initialized) return true;
-        if (_initFailed) return false;
+        if (_initFailed || _disposed) return false;
+        _d3dContextLock = d3dContextLock;
 
         try
         {
@@ -233,7 +236,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             ffmpeg.av_dict_set(&opts, "delay", "0", 0); // No encode delay
             ffmpeg.av_dict_set(&opts, "rc-lookahead", "0", 0); // No lookahead — encode immediately
 
-            int ret = ffmpeg.avcodec_open2(_codecCtx, codec, &opts);
+            int ret;
+            lock (_d3dContextLock)
+            {
+                ret = ffmpeg.avcodec_open2(_codecCtx, codec, &opts);
+            }
             ffmpeg.av_dict_free(&opts);
             if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_open2 failed: {FfmpegError(ret)}"); _initFailed = true; return false; }
 
@@ -280,19 +287,25 @@ public sealed unsafe class FfmpegEncoder : IDisposable
 
     private void SetupHardwareContext(IntPtr d3dDevice)
     {
-        // Create hw device context and inject our D3D11 device
+        // Create hw device context and inject the WGC D3D11 device.
+        // IMPORTANT: We share the same D3D11 device as WgcCapture so textures are compatible.
+        // D3D11 immediate contexts are NOT thread-safe, so all D3D context operations in the
+        // encode thread MUST be wrapped in _d3dContextLock (same lock as WgcCapture._disposeLock).
         _hwDeviceCtx = ffmpeg.av_hwdevice_ctx_alloc(AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA);
         if (_hwDeviceCtx == null) throw new Exception("av_hwdevice_ctx_alloc failed");
 
         var hwDevCtx = (AVHWDeviceContext*)_hwDeviceCtx->data;
         var d3d11DevCtx = (AVD3D11VADeviceContext*)hwDevCtx->hwctx;
 
-        // Set our existing D3D11 device — FFmpeg will use it for NVENC
         d3d11DevCtx->device = (ID3D11Device*)d3dDevice;
-        // Note: device_context is optional — FFmpeg will create one if null
 
-        int ret = ffmpeg.av_hwdevice_ctx_init(_hwDeviceCtx);
-        if (ret < 0) throw new Exception($"av_hwdevice_ctx_init failed: {FfmpegError(ret)}");
+        // Lock the D3D context during init — OnFrameArrived on the WGC callback thread
+        // may be using the same immediate context concurrently.
+        lock (_d3dContextLock)
+        {
+            int ret = ffmpeg.av_hwdevice_ctx_init(_hwDeviceCtx);
+            if (ret < 0) throw new Exception($"av_hwdevice_ctx_init failed: {FfmpegError(ret)}");
+        }
 
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] D3D11VA hardware context initialized with device 0x{d3dDevice:X}");
 
@@ -307,8 +320,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         framesCtx->height = (int)_height;
         framesCtx->initial_pool_size = 0; // Let FFmpeg manage pool — fixed value causes texture creation failure
 
-        ret = ffmpeg.av_hwframe_ctx_init(_hwFramesCtx);
-        if (ret < 0) throw new Exception($"av_hwframe_ctx_init failed: {FfmpegError(ret)}");
+        lock (_d3dContextLock)
+        {
+            int ret2 = ffmpeg.av_hwframe_ctx_init(_hwFramesCtx);
+            if (ret2 < 0) throw new Exception($"av_hwframe_ctx_init failed: {FfmpegError(ret2)}");
+        }
 
         _codecCtx->hw_frames_ctx = ffmpeg.av_buffer_ref(_hwFramesCtx);
         ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Hardware frames context initialized: {_width}x{_height} D3D11/BGRA");
@@ -432,7 +448,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     /// </summary>
     public void EncodeFrame(IntPtr srcTexture, uint width, uint height)
     {
-        if (_initFailed || !_initialized) return;
+        if (_disposed || _initFailed || !_initialized) return;
         if ((width & ~1u) != _width || (height & ~1u) != _height)
         {
             if (_totalFrames == 0)
@@ -484,6 +500,7 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             }
             lastEncodeTicks = now;
 
+            if (_disposed) break; // re-check before expensive FFmpeg call
             try
             {
                 EncodeFrameInternal(texture, _lastWidth, _lastHeight);
@@ -500,19 +517,24 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     {
         int ret;
 
-        using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
+        // Lock the D3D11 immediate context — OnFrameArrived on the WGC callback thread
+        // uses the same context. D3D11 contexts are NOT thread-safe.
+        lock (_d3dContextLock)
         {
-            ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
-            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
-        }
+            using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
+            {
+                ret = ffmpeg.av_hwframe_get_buffer(_hwFramesCtx, _hwFrame, 0);
+                if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
+            }
 
-        // Copy our D3D11 texture to the frame's D3D11 texture
-        using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
-        {
-            IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
-            int dstIndex = (int)_hwFrame->data[1];
-            CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
-        }
+            // Copy our D3D11 texture to the frame's D3D11 texture
+            using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
+            {
+                IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
+                int dstIndex = (int)_hwFrame->data[1];
+                CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
+            }
+        } // release D3D context lock before NVENC encode (NVENC has its own hardware unit)
 
         // Wall clock pts — monotonically increasing, never duplicate
         double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
@@ -657,26 +679,46 @@ public sealed unsafe class FfmpegEncoder : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposeGuard, 1) != 0) return;
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose === START ===");
         _initialized = false;
         _disposed = true;
-        _frameSignal.Set(); // Wake encode thread so it exits
-        _encodeThread?.Join(2000);
+        _frameSignal.Set();
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: joining encode thread...");
+        if (_encodeThread != null && !_encodeThread.Join(5000))
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] WARNING: encode thread did not exit in 5s");
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: encode thread joined");
 
-        if (_fmtCtx != null)
+        // Lock the D3D context during all FFmpeg cleanup — OnFrameArrived on the WGC
+        // callback thread may still be using the same D3D11 immediate context concurrently.
+        // The streamer (WgcCapture) hasn't been disposed yet at this point.
+        // av_write_trailer flushes the codec which can use the D3D context via NVENC.
+        var ctxLock = _d3dContextLock;
+        if (ctxLock != null) Monitor.Enter(ctxLock);
+        try
         {
-            try { ffmpeg.av_write_trailer(_fmtCtx); } catch { }
-        }
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: writing trailer");
+            if (_fmtCtx != null)
+            {
+                try { ffmpeg.av_write_trailer(_fmtCtx); } catch (Exception ex) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: trailer error: {ex.Message}"); }
+            }
 
-        if (_pkt != null) { var p = _pkt; ffmpeg.av_packet_free(&p); _pkt = null; }
-        if (_hwFrame != null) { var f = _hwFrame; ffmpeg.av_frame_free(&f); _hwFrame = null; }
-        if (_audioFrame != null) { var f = _audioFrame; ffmpeg.av_frame_free(&f); _audioFrame = null; }
-        if (_audioCodecCtx != null) { var c = _audioCodecCtx; ffmpeg.avcodec_free_context(&c); _audioCodecCtx = null; }
-        if (_swrCtx != null) { var s = _swrCtx; ffmpeg.swr_free(&s); _swrCtx = null; }
-        if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
-        if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
-        if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing packets/frames");
+            if (_pkt != null) { var p = _pkt; ffmpeg.av_packet_free(&p); _pkt = null; }
+            if (_hwFrame != null) { var f = _hwFrame; ffmpeg.av_frame_free(&f); _hwFrame = null; }
+            if (_audioFrame != null) { var f = _audioFrame; ffmpeg.av_frame_free(&f); _audioFrame = null; }
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing codec contexts");
+            if (_audioCodecCtx != null) { var c = _audioCodecCtx; ffmpeg.avcodec_free_context(&c); _audioCodecCtx = null; }
+            if (_swrCtx != null) { var s = _swrCtx; ffmpeg.swr_free(&s); _swrCtx = null; }
+            if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing hw contexts");
+            if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
+            if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
+        }
+        finally { if (ctxLock != null) Monitor.Exit(ctxLock); }
         _audioCapture = null;
 
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose: freeing format context");
         if (_fmtCtx != null)
         {
             if (_fmtCtx->pb != null)
@@ -694,6 +736,6 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         try { if (_dataAvailable.CurrentCount == 0) _dataAvailable.Release(); } catch { }
         try { _dataAvailable.Dispose(); } catch { }
 
-        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Disposed, {_totalFrames} total frames");
+        ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Dispose === DONE === {_totalFrames} total frames");
     }
 }

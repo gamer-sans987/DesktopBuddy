@@ -9,6 +9,7 @@ public sealed class DesktopStreamer : IDisposable
 {
     private readonly IntPtr _hwnd;
     private WgcCapture _wgc;
+    private int _disposed;
 
     public int Width { get; private set; }
     public int Height { get; private set; }
@@ -16,6 +17,7 @@ public sealed class DesktopStreamer : IDisposable
     public int FramesCaptured => _wgc?.FramesCaptured ?? 0;
     public bool IsValid => _wgc?.IsValid ?? false;
     public bool UsingWgc => true;
+    public object D3dContextLock => _wgc?.D3dContextLock;
 
     public Action<IntPtr, IntPtr, int, int> OnGpuFrame
     {
@@ -58,6 +60,8 @@ public sealed class DesktopStreamer : IDisposable
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _wgc?.Dispose();
+        _wgc = null;
     }
 }
