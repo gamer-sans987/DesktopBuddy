@@ -66,6 +66,15 @@ Creates `DesktopBuddy.zip` from the last build. Extract into the Resonite root f
 4. Interact with the panel using VR controllers (touch, scroll, keyboard)
 5. Other users in the session see the stream via Cloudflare Tunnel
 
+## Troubleshooting
+
+**Streaming not working for other users?** The mod runs a local HTTP server on port 48080. If streaming isn't working, run this command once as Administrator to allow it through:
+
+```
+netsh http add urlacl url=http://+:48080/ user=Everyone
+```
+
+The mod tries to do this automatically, but it may fail without admin privileges.
 
 ## License
 

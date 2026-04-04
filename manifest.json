@@ -1,0 +1,19 @@
+{
+  "name": "DesktopBuddy",
+  "id": "com.devl0rd.DesktopBuddy",
+  "author": "Dustin",
+  "version": "1.0.0",
+  "description": "World-space desktop/window viewer with touch input, GPU-accelerated capture via WGC, hardware H.264 encoding via NVENC, and remote streaming over Cloudflare Tunnel. Supports per-window audio, child window detection, and VR controller input injection.",
+  "sourceLocation": "https://github.com/DevL0rd/DesktopBuddy",
+  "category": "Misc",
+  "platforms": [
+    "windows"
+  ],
+  "tags": [
+    "desktop",
+    "screen share",
+    "streaming",
+    "VR",
+    "window capture"
+  ]
+}

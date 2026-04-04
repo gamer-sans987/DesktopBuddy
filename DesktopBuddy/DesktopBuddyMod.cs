@@ -17,9 +17,9 @@ namespace DesktopBuddy;
 public class DesktopBuddyMod : ResoniteMod
 {
     public override string Name => "DesktopBuddy";
-    public override string Author => "DesktopBuddy";
+    public override string Author => "DevL0rd";
     public override string Version => "1.0.0";
-    public override string Link => "https://github.com/DesktopBuddy/DesktopBuddy";
+    public override string Link => "https://github.com/DevL0rd/DesktopBuddy";
 
     internal static ModConfiguration? Config;
 
