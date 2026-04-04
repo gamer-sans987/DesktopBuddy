@@ -42,21 +42,19 @@ public sealed class MjpegServer : IDisposable
         }
         catch (Exception ex)
         {
-            ResoniteMod.Msg($"[MjpegServer] http://+ failed ({ex.Message}), adding urlacl...");
-            // Try to add urlacl so http://+ works (needed for cloudflare tunnel Host header)
+            ResoniteMod.Msg($"[MjpegServer] http://+ failed ({ex.Message}), requesting admin urlacl...");
+            // Spawn elevated netsh to add urlacl — triggers UAC prompt
             try
             {
                 var psi = new System.Diagnostics.ProcessStartInfo
                 {
                     FileName = "netsh",
-                    Arguments = $"http add urlacl url=http://+:{_port}/ user=Everyone",
+                    Arguments = $"http add urlacl url=http://+:{_port}/ sddl=D:(A;;GX;;;S-1-1-0)",
                     UseShellExecute = true,
-                    Verb = "runas",
-                    CreateNoWindow = true,
-                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                    Verb = "runas"
                 };
                 var proc = System.Diagnostics.Process.Start(psi);
-                proc?.WaitForExit(5000);
+                proc?.WaitForExit();
                 ResoniteMod.Msg($"[MjpegServer] urlacl result: {proc?.ExitCode}");
             }
             catch (Exception urlEx)
